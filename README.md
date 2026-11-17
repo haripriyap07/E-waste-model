@@ -68,3 +68,9 @@ The confidence-based approach improves sorting reliability while maintaining a b
 ---
 
 **Note:** The reported metrics are based on the evaluated test dataset of 300 images. Performance may vary on real-world images and different environmental conditions.
+<img width="2250" height="900" alt="sample_predictions" src="https://github.com/user-attachments/assets/6ceda0ef-4d45-4549-a9d7-9d399a29a209" />
+<img width="567" height="490" alt="image" src="https://github.com/user-attachments/assets/a29c33a9-3edf-4803-b4ee-659f05fc4f24" />
+
+<img width="1189" height="440" alt="image" src="https://github.com/user-attachments/assets/c823081c-59c7-43c3-b414-8b74f5bd8ce1" />
+
+
