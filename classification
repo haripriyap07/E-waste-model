@@ -1,0 +1,324 @@
+# ============================================================
+# E-Waste Sorting — Dataset Remap + MobileNetV2 Transfer Learning
+# Run this top to bottom in Google Colab (Runtime > Change runtime type > GPU)
+# ============================================================
+
+# ------------------------------------------------------------
+# 0. SETUP
+# Upload/extract the Kaggle "e-waste-image-dataset" so you have:
+#
+# modified-dataset/
+#   train/  {Television, Washing Machine, Player, Printer, Mouse, PCB,
+#             Microwave, Mobile, Battery, Keyboard}
+#   test/   {same 10 folders}
+#   val/    {same 10 folders}
+#
+# This script remaps those into your 4-class taxonomy:
+#   pcb      <- PCB
+#   battery  <- Battery
+#   plastic  <- Mouse, Keyboard, Player, Mobile
+#   metal    <- Television, Washing Machine, Printer, Microwave
+# ------------------------------------------------------------
+
+!pip install -q tensorflow matplotlib scikit-learn seaborn
+
+import tensorflow as tf
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import os, shutil, random
+
+# ------------------------------------------------------------
+# 1. REMAP — merge the 10 source folders into your 4-class taxonomy
+# ------------------------------------------------------------
+SOURCE_DIR = "modified-dataset"   # change if your extracted folder has a different name
+TARGET_DIR = "dataset"
+
+CLASS_MAP = {
+    "pcb":     ["PCB"],
+    "battery": ["Battery"],
+    "plastic": ["Mouse", "Keyboard", "Player", "Mobile"],
+    "metal":   ["Television", "Washing Machine", "Printer", "Microwave"],
+}
+CLASS_NAMES = list(CLASS_MAP.keys())   # ["pcb", "battery", "plastic", "metal"]
+
+# Optional: cap images per class so plastic/metal (4 source folders each)
+# don't massively outnumber pcb/battery (1 source folder each).
+# Set to None to keep everything, or an integer e.g. 150 to balance.
+CAP_PER_CLASS_PER_SPLIT = None
+
+def remap_dataset(source_dir, target_dir, class_map, splits=("train", "val", "test"), cap=None, seed=42):
+    random.seed(seed)
+    counts = {}
+    for split in splits:
+        split_src = os.path.join(source_dir, split)
+        if not os.path.isdir(split_src):
+            print(f"Skipping missing split: {split_src}")
+            continue
+        for target_class, source_folders in class_map.items():
+            target_path = os.path.join(target_dir, split, target_class)
+            os.makedirs(target_path, exist_ok=True)
+
+            pooled_files = []
+            for folder in source_folders:
+                folder_path = os.path.join(split_src, folder)
+                if not os.path.isdir(folder_path):
+                    print(f"  WARNING: {folder_path} not found, skipping")
+                    continue
+                for fname in os.listdir(folder_path):
+                    pooled_files.append(os.path.join(folder_path, fname))
+
+            random.shuffle(pooled_files)
+            if cap is not None:
+                pooled_files = pooled_files[:cap]
+
+            for i, src_file in enumerate(pooled_files):
+                ext = os.path.splitext(src_file)[1]
+                dst_file = os.path.join(target_path, f"{target_class}_{i}{ext}")
+                shutil.copy(src_file, dst_file)
+
+            counts[f"{split}/{target_class}"] = len(pooled_files)
+
+    print("\n--- Remapped dataset counts ---")
+    for k, v in counts.items():
+        print(f"{k}: {v} images")
+    return counts
+
+remap_dataset(SOURCE_DIR, TARGET_DIR, CLASS_MAP, cap=CAP_PER_CLASS_PER_SPLIT)
+
+# ------------------------------------------------------------
+# 2. DATA LOADING
+# ------------------------------------------------------------
+TRAIN_DIR = os.path.join(TARGET_DIR, "train")
+VAL_DIR = os.path.join(TARGET_DIR, "val")
+TEST_DIR = os.path.join(TARGET_DIR, "test")
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+
+train_datagen = ImageDataGenerator(
+    preprocessing_function=preprocess_input,
+    rotation_range=25,
+    width_shift_range=0.15,
+    height_shift_range=0.15,
+    zoom_range=0.15,
+    brightness_range=[0.7, 1.3],
+    horizontal_flip=True,
+)
+eval_datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
+
+train_gen = train_datagen.flow_from_directory(
+    TRAIN_DIR, target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    class_mode="categorical", classes=CLASS_NAMES, shuffle=True
+)
+val_gen = eval_datagen.flow_from_directory(
+    VAL_DIR, target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    class_mode="categorical", classes=CLASS_NAMES, shuffle=False
+)
+test_gen = eval_datagen.flow_from_directory(
+    TEST_DIR, target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    class_mode="categorical", classes=CLASS_NAMES, shuffle=False
+)
+
+# ------------------------------------------------------------
+# 3. MODEL — MobileNetV2, frozen base, new classification head
+# ------------------------------------------------------------
+base_model = MobileNetV2(input_shape=(224, 224, 3), include_top=False, weights="imagenet")
+base_model.trainable = False
+
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(128, activation="relu")(x)
+x = Dropout(0.3)(x)
+outputs = Dense(len(CLASS_NAMES), activation="softmax")(x)
+
+model = Model(inputs=base_model.input, outputs=outputs)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+model.summary()
+
+# ------------------------------------------------------------
+# 4. TRAIN
+# ------------------------------------------------------------
+EPOCHS = 15
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True),
+    tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2),
+]
+
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=EPOCHS,
+    callbacks=callbacks
+)
+
+model.save("ewaste_mobilenetv2.h5")
+print("Model saved as ewaste_mobilenetv2.h5")
+
+# ------------------------------------------------------------
+# 5. TEST SET EVALUATION (held-out, unseen during training)
+# ------------------------------------------------------------
+test_loss, test_acc = model.evaluate(test_gen)
+print(f"\nTest accuracy: {test_acc:.2%} | Test loss: {test_loss:.4f}")
+
+# ------------------------------------------------------------
+# 6. RESULTS — accuracy/loss curves (slide-ready plot)
+# ------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+axes[0].plot(history.history["accuracy"], label="Train Accuracy", linewidth=2)
+axes[0].plot(history.history["val_accuracy"], label="Val Accuracy", linewidth=2)
+axes[0].set_title("Model Accuracy")
+axes[0].set_xlabel("Epoch")
+axes[0].set_ylabel("Accuracy")
+axes[0].legend()
+axes[0].grid(alpha=0.3)
+
+axes[1].plot(history.history["loss"], label="Train Loss", linewidth=2)
+axes[1].plot(history.history["val_loss"], label="Val Loss", linewidth=2)
+axes[1].set_title("Model Loss")
+axes[1].set_xlabel("Epoch")
+axes[1].set_ylabel("Loss")
+axes[1].legend()
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("training_curves.png", dpi=150)
+plt.show()
+
+# ------------------------------------------------------------
+# 7. CONFUSION MATRIX (on test set)
+# ------------------------------------------------------------
+test_gen.reset()
+y_true = test_gen.classes
+y_pred_probs = model.predict(test_gen)
+y_pred = np.argmax(y_pred_probs, axis=1)
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix — E-Waste Classification (Test Set)")
+plt.tight_layout()
+plt.savefig("confusion_matrix.png", dpi=150)
+plt.show()
+
+print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
+
+# ------------------------------------------------------------
+# 8. CONFIDENCE-THRESHOLD LOGIC (novelty point — low-confidence -> manual review)
+# ------------------------------------------------------------
+CONFIDENCE_THRESHOLD = 0.70
+
+def classify_with_confidence(pred_probs, class_names, threshold=CONFIDENCE_THRESHOLD):
+    idx = np.argmax(pred_probs)
+    confidence = pred_probs[idx]
+    if confidence < threshold:
+        return "Manual Review", confidence
+    return class_names[idx], confidence
+
+auto_sorted, manual_review, correct_auto = 0, 0, 0
+for i, probs in enumerate(y_pred_probs):
+    label, conf = classify_with_confidence(probs, CLASS_NAMES)
+    if label == "Manual Review":
+        manual_review += 1
+    else:
+        auto_sorted += 1
+        if CLASS_NAMES[y_true[i]] == label:
+            correct_auto += 1
+
+print(f"\n--- Confidence Threshold Report (threshold={CONFIDENCE_THRESHOLD}) ---")
+print(f"Auto-sorted: {auto_sorted}/{len(y_pred_probs)} ({100*auto_sorted/len(y_pred_probs):.1f}%)")
+print(f"Flagged for manual review: {manual_review}/{len(y_pred_probs)} ({100*manual_review/len(y_pred_probs):.1f}%)")
+if auto_sorted > 0:
+    print(f"Accuracy on auto-sorted items only: {100*correct_auto/auto_sorted:.1f}%")
+
+# ------------------------------------------------------------
+# 9. SAMPLE PREDICTIONS — visual, demo-friendly for your slides
+# ------------------------------------------------------------
+test_gen.reset()
+sample_batch_images, sample_batch_labels = next(test_gen)
+sample_preds = model.predict(sample_batch_images)
+
+n_show = min(10, len(sample_batch_images))
+fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+axes = axes.flatten()
+
+for i in range(n_show):
+    img = sample_batch_images[i]
+    img_display = (img - img.min()) / (img.max() - img.min())
+    label, conf = classify_with_confidence(sample_preds[i], CLASS_NAMES)
+    true_label = CLASS_NAMES[np.argmax(sample_batch_labels[i])]
+    color = "green" if label == true_label else "red"
+
+    axes[i].imshow(img_display)
+    axes[i].set_title(f"Pred: {label} ({conf:.0%})\nTrue: {true_label}", fontsize=9, color=color)
+    axes[i].axis("off")
+
+for j in range(n_show, len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+plt.savefig("sample_predictions.png", dpi=150)
+plt.show()
+
+# ------------------------------------------------------------
+# 10. EXPORT TO TFLITE — for Raspberry Pi deployment readiness
+# ------------------------------------------------------------
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+tflite_model = converter.convert()
+
+with open("ewaste_mobilenetv2.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print(f"\nTFLite model saved: ewaste_mobilenetv2.tflite")
+print(f"Original .h5 size: {os.path.getsize('ewaste_mobilenetv2.h5') / 1e6:.2f} MB")
+print(f"TFLite size: {os.path.getsize('ewaste_mobilenetv2.tflite') / 1e6:.2f} MB")
+
+# ------------------------------------------------------------
+# 11. (OPTIONAL) TFLITE INFERENCE TIMING TEST — run this ON THE RASPBERRY PI
+# ------------------------------------------------------------
+"""
+# --- Run this block ON THE RASPBERRY PI, not in Colab ---
+import tflite_runtime.interpreter as tflite
+import numpy as np
+from PIL import Image
+import time
+
+interpreter = tflite.Interpreter(model_path="ewaste_mobilenetv2.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+img = Image.open("test_image.jpg").resize((224, 224))
+img_array = np.array(img, dtype=np.float32)
+img_array = (img_array / 127.5) - 1.0
+img_array = np.expand_dims(img_array, axis=0)
+
+start = time.time()
+interpreter.set_tensor(input_details[0]['index'], img_array)
+interpreter.invoke()
+output = interpreter.get_tensor(output_details[0]['index'])
+elapsed = time.time() - start
+
+CLASS_NAMES = ["pcb", "battery", "plastic", "metal"]
+pred_idx = np.argmax(output[0])
+print(f"Predicted: {CLASS_NAMES[pred_idx]} ({output[0][pred_idx]:.2%} confidence)")
+print(f"Inference time: {elapsed*1000:.1f} ms")
+"""
+
+print("\nDone. Files generated: ewaste_mobilenetv2.h5, ewaste_mobilenetv2.tflite, "
+      "training_curves.png, confusion_matrix.png, sample_predictions.png")
